@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <title>얼굴로 블록깨기 🧱⚡ </title>
+  <style>
+    :root { color-scheme: dark; }
+    body { margin: 0; padding: 16px; background:#0b0b10; color:#eaeaea; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    .wrap { max-width: 980px; margin: 0 auto; display: grid; gap: 12px; }
+    .toolbar { display:flex; gap:8px; align-items:center; flex-wrap:wrap; }
+    .pill { background:#1c1f2b; border:1px solid #2c3348; padding:8px 12px; border-radius:999px; }
+    button, input[type="range"] { background:#1c1f2b; color:#eaeaea; border:1px solid #2c3348; border-radius:8px; padding:8px 12px; cursor:pointer; }
+    button:disabled { opacity:.6; cursor:not-allowed; }
+    .stage { position: relative; width: 100%; aspect-ratio: 16/9; background:#111; border-radius: 12px; overflow: hidden; }
+
+    video, canvas { position:absolute; inset:0; width:100%; height:100%; object-fit: cover; transform: scaleX(-1); }
+    .hud { position:absolute; left:12px; top:12px; z-index:10; background:#00000066; padding:6px 10px; border-radius:8px; font-variant-numeric: tabular-nums; }
+    .hint { opacity:.85 }
+    .ok { color:#9cf59c; font-weight:600; }
+    .warn { color:#ffd166; font-weight:600; }
+    .error { color:#ff8a8a; font-weight:600; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>얼굴로 블록깨기🧱⚡</h1>
+
+    <div class="toolbar">
+      <button id="btnCam">카메라 시작</button>
+      <button id="btnGame" disabled>게임 시작</button>
+
+      <label class="pill">패들 크기
+        <input id="paddleSize" type="range" min="0.8" max="1.8" step="0.05" value="1.4">
+      </label>
+
+      <span class="pill">상태: <span id="status">대기</span></span>
+      <span class="pill">점수: <span id="score">0</span></span>
+      <span class="pill">남은 벽돌: <span id="left">0</span></span>
+      <span class="pill">버프: <span id="buff">없음</span></span>
+    </div>
+
+    <div class="stage">
+      <div class="hud" id="hud">얼굴을 좌우로 움직여 패들을 조종하세요!</div>
+      <video id="video" playsinline muted></video>
+      <canvas id="overlay"></canvas>
+    </div>
+
+    <p class="hint">
+      • GitHub Pages(HTTPS) 또는 Live Server에서 실행하세요. 주소창의 🔒 → <b>카메라: 허용</b> 확인.<br/>
+      • 패들 크기 슬라이더는 <b>즉시</b> 반영됩니다. 아이템을 받으면 일정 시간 효과 유지! (🔷 확장 / 🟪 감속)
+    </p>
+  </div>
+
+  <script type="module">
+    import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.13";
+
+    const els = {
+      btnCam: document.getElementById('btnCam'),
+      btnGame: document.getElementById('btnGame'),
+      paddleSize: document.getElementById('paddleSize'),
+      video: document.getElementById('video'),
+      canvas: document.getElementById('overlay'),
+      status: document.getElementById('status'),
+      score: document.getElementById('score'),
+      left: document.getElementById('left'),
+      buff: document.getElementById('buff'),
+      hud: document.getElementById('hud'),
+    };
+
+    let faceLandmarker = null;
+    let running = false;
+    let gameOn = false;
+    let lastTime = performance.now();
+
+    function setStatus(t, cls=""){ els.status.textContent = t; els.status.className = cls; }
+    function setBuffText() {
+      const now = performance.now();
+      const texts = [];
+      if (game.buff.widenUntil > now) texts.push("🔷 확장");
+      if (game.buff.slowUntil  > now) texts.push("🟪 감속");
+      els.buff.textContent = texts.length ? texts.join(", ") : "없음";
+    }
+
+    function fitCanvas() {
+      const rect = els.video.getBoundingClientRect();
+      els.canvas.width = rect.width * devicePixelRatio;
+      els.canvas.height = rect.height * devicePixelRatio;
+    }
+
+    async function setupLandmarker() {
+      setStatus("모델 로딩 중…");
+      const vision = await FilesetResolver.forVisionTasks("https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.13/wasm");
+      faceLandmarker = await FaceLandmarker.createFromOptions(vision, {
+        baseOptions: { modelAssetPath: "https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task" },
+        runningMode: "VIDEO",
+        numFaces: 1
+      });
+      setStatus("준비됨", "ok");
+    }
+
+    async function startCamera() {
+      try {
+        els.btnCam.disabled = true;
+        setStatus("카메라 요청 중…");
+        const stream = await navigator.mediaDevices.getUserMedia({
+          video: { width: 1280, height: 720, facingMode: "user" }, audio: false
+        });
+        els.video.srcObject = stream;
+        await els.video.play();
+        fitCanvas();
+        addEventListener('resize', fitCanvas, { passive: true });
+        if (!faceLandmarker) await setupLandmarker();
+        running = true;
+        els.btnGame.disabled = false;
+        setStatus("카메라 연결됨", "ok");
+        requestAnimationFrame(loop);
+      } catch (e) {
+        console.error(e);
+        setStatus("카메라 실패: 권한/HTTPS 확인", "error");
+        els.btnCam.disabled = false;
+      }
+    }
+
+    function getBBox(landmarks, w, h) {
+      let minX=Infinity, minY=Infinity, maxX=-Infinity, maxY=-Infinity;
+      for (const p of landmarks) {
+        const x = p.x * w, y = p.y * h;
+        if (x<minX) minX=x; if (y<minY) minY=y;
+        if (x>maxX) maxX=x; if (y>maxY) maxY=y;
+      }
+      return { cx:(minX+maxX)/2, cy:(minY+maxY)/2, w:maxX-minX, h:maxY-minY };
+    }
+
+    const game = {
+
+      paddleX: 0, paddleBaseW: 140, paddleH: 14, widenMultiplier: 1,
+
+      ballX: 0, ballY: 0, ballVX: 260, ballVY: -260, ballR: 8,
+
+      bricks: [], rows: 5, cols: 9, brickW: 80, brickH: 20, gap: 6,
+      score: 0,
+
+      items: [], // {x,y,vy,type:'widen'|'slow',alive:true}
+      buff: { widenUntil: 0, slowUntil: 0 }
+    };
+
+    function effectivePaddleW() {
+      // 버프 시간 확인
+      const now = performance.now();
+      game.widenMultiplier = (game.buff.widenUntil > now) ? 1.6 : 1; // 60% 확장
+      setBuffText();
+      return Math.max(70, Math.floor(game.paddleBaseW * game.widenMultiplier));
+    }
+
+    function initGame(vw, vh) {
+      // 슬라이더 값을 즉시 반영
+      const scale = parseFloat(els.paddleSize.value);
+      game.paddleBaseW = Math.max(90, Math.floor(vw * 0.12 * scale));
+      const prevCenter = game.paddleX + effectivePaddleW()/2 || vw/2;
+
+      game.score = 0;
+      game.paddleH = 14;
+      game.paddleX = Math.max(0, Math.min(vw - effectivePaddleW(), prevCenter - effectivePaddleW()/2));
+
+      game.ballX = vw/2; game.ballY = vh * 0.7;
+      game.ballVX = 260; game.ballVY = -260; game.ballR = 8;
+
+      const marginX = 16, marginTop = 16 + 40;
+      game.bricks = [];
+      game.brickW = Math.floor((vw - marginX*2 - game.gap*(game.cols-1)) / game.cols);
+      game.brickH = 22;
+      for (let r=0;r<game.rows;r++){
+        for(let c=0;c<game.cols;c++){
+          const x = marginX + c*(game.brickW + game.gap);
+          const y = marginTop + r*(game.brickH + game.gap);
+          game.bricks.push({x, y, alive:true, hp: 1 + Math.floor(r/2)}); // 윗줄일수록 단단
+        }
+      }
+      game.items = [];
+      game.buff = { widenUntil:0, slowUntil:0 };
+      setBuffText();
+      els.score.textContent = "0";
+      els.left.textContent = game.bricks.length.toString();
+      els.hud.textContent = "게임 시작! 아이템을 받아서 유리하게 플레이해보세요!";
+    }
+
+    function maybeDropItem(x, y) {
+      const dropChance = 0.22; // 22%
+      if (Math.random() > dropChance) return;
+      const type = Math.random() < 0.5 ? "widen" : "slow";
+      game.items.push({ x: x + game.brickW/2, y, vy: 120, type, alive: true });
+    }
+
+    function drawGame(ctx, vw, vh) {
+
+      const w = effectivePaddleW();
+      ctx.fillStyle = "#74b9ff";
+      ctx.fillRect(game.paddleX, vh - 36, w, game.paddleH);
+
+
+      const slow = (performance.now() < game.buff.slowUntil);
+      ctx.fillStyle = slow ? "#a29bfe" : "#ffd166";
+      ctx.beginPath(); ctx.arc(game.ballX, game.ballY, game.ballR, 0, Math.PI*2); ctx.fill();
+
+      for (const b of game.bricks) if (b.alive) {
+        ctx.fillStyle = b.hp===1 ? "#55efc4" : (b.hp===2? "#81ecec" : "#a29bfe");
+        ctx.fillRect(b.x, b.y, game.brickW, game.brickH);
+      }
+
+      for (const it of game.items) if (it.alive) {
+        if (it.type === "widen") {
+          ctx.fillStyle = "#00d4ff"; // 청록 캡슐 + W
+        } else {
+          ctx.fillStyle = "#b388ff"; // 보라 캡슐 + S
+        }
+        ctx.beginPath(); ctx.ellipse(it.x, it.y, 12, 8, 0, 0, Math.PI*2); ctx.fill();
+        ctx.fillStyle = "#0b0b10";
+        ctx.font = "bold 12px system-ui";
+        ctx.textAlign = "center"; ctx.textBaseline = "middle";
+        ctx.fillText(it.type === "widen" ? "W" : "S", it.x, it.y);
+      }
+    }
+
+    function updateGame(dt, vw, vh) {
+
+      const slow = (performance.now() < game.buff.slowUntil);
+      const slowMul = slow ? 0.7 : 1;
+
+      game.ballX += game.ballVX * dt * slowMul;
+      game.ballY += game.ballVY * dt * slowMul;
+
+      if (game.ballX - game.ballR < 0) { game.ballX = game.ballR; game.ballVX *= -1; }
+      if (game.ballX + game.ballR > vw) { game.ballX = vw - game.ballR; game.ballVX *= -1; }
+      if (game.ballY - game.ballR < 0)   { game.ballY = game.ballR; game.ballVY *= -1; }
+
+      const w = effectivePaddleW();
+      const py = vh - 36;
+      if (game.ballY + game.ballR >= py &&
+          game.ballY + game.ballR <= py + game.paddleH &&
+          game.ballX >= game.paddleX &&
+          game.ballX <= game.paddleX + w) {
+        const hit = (game.ballX - (game.paddleX + w/2)) / (w/2);
+        const speed = Math.hypot(game.ballVX, game.ballVY) * 1.03; // 점점 빨라짐
+        const angle = hit * (Math.PI/3); // 최대 ±60도
+        game.ballVX = Math.sin(angle) * speed;
+        game.ballVY = -Math.cos(angle) * speed;
+        game.ballY = py - game.ballR - 0.1;
+      }
+
+      for (const b of game.bricks) if (b.alive) {
+        if (game.ballX + game.ballR > b.x && game.ballX - game.ballR < b.x + game.brickW &&
+            game.ballY + game.ballR > b.y && game.ballY - game.ballR < b.y + game.brickH) {
+          const overlapL = game.ballX + game.ballR - b.x;
+          const overlapR = (b.x + game.brickW) - (game.ballX - game.ballR);
+          const overlapT = game.ballY + game.ballR - b.y;
+          const overlapB = (b.y + game.brickH) - (game.ballY - game.ballR);
+          const minOverlap = Math.min(overlapL, overlapR, overlapT, overlapB);
+          if (minOverlap === overlapL) game.ballVX = -Math.abs(game.ballVX);
+          else if (minOverlap === overlapR) game.ballVX = Math.abs(game.ballVX);
+          else if (minOverlap === overlapT) game.ballVY = -Math.abs(game.ballVY);
+          else game.ballVY = Math.abs(game.ballVY);
+
+          b.hp -= 1;
+          if (b.hp <= 0) {
+            b.alive = false;
+            maybeDropItem(b.x, b.y);
+          }
+          game.score += 10;
+          els.score.textContent = game.score.toString();
+          els.left.textContent = game.bricks.filter(bb=>bb.alive).length.toString();
+        }
+      }
+
+      for (const it of game.items) if (it.alive) {
+        it.y += it.vy * dt;
+        if (it.y > vh + 20) { it.alive = false; continue; }
+        if (it.y >= py && it.y <= py + game.paddleH + 12 &&
+            it.x >= game.paddleX && it.x <= game.paddleX + w) {
+          it.alive = false;
+          const now = performance.now();
+          if (it.type === "widen") {
+            game.buff.widenUntil = Math.max(game.buff.widenUntil, now) + 10000; // 10초
+          } else {
+            game.buff.slowUntil  = Math.max(game.buff.slowUntil,  now) + 8000;  // 8초
+          }
+          setBuffText();
+        }
+      }
+
+      game.paddleX = Math.max(0, Math.min(vw - w, game.paddleX));
+
+      const alive = game.bricks.some(b=>b.alive);
+      if (!alive) {
+        gameOn = false;
+        els.hud.textContent = "🎉 클리어! ‘게임 시작’으로 다시 플레이하세요.";
+      }
+      if (game.ballY - game.ballR > vh) {
+        gameOn = false;
+        els.hud.textContent = "💥 실패! ‘게임 시작’으로 재시작하세요.";
+      }
+    }
+
+    function loop(now) {
+      if (!running) return;
+      const ctx = els.canvas.getContext('2d');
+      ctx.clearRect(0,0,els.canvas.width, els.canvas.height);
+
+      let res = null;
+      try {
+        if (faceLandmarker && els.video.readyState >= 2) {
+          res = faceLandmarker.detectForVideo(els.video, now);
+        }
+      } catch (e) {
+        console.error(e);
+        setStatus("추적 오류(권한/조명 확인)", "error");
+      }
+
+      ctx.save(); ctx.scale(devicePixelRatio, devicePixelRatio);
+      const vw = els.video.clientWidth, vh = els.video.clientHeight;
+
+      if (res?.faceLandmarks?.length) {
+        const { cx } = getBBox(res.faceLandmarks[0], vw, vh);
+        const w = effectivePaddleW();
+        const targetX = cx - w/2;
+        game.paddleX = game.paddleX * 0.7 + targetX * 0.3; // 부드러운 보간
+      }
+
+      const dt = Math.min(0.035, (now - lastTime)/1000);
+      lastTime = now;
+      if (gameOn) updateGame(dt, vw, vh);
+      drawGame(ctx, vw, vh);
+      ctx.restore();
+
+      requestAnimationFrame(loop);
+    }
+
+    els.btnCam.addEventListener('click', startCamera);
+
+    els.btnGame.addEventListener('click', () => {
+      if (!running) return;
+      const vw = els.video.clientWidth, vh = els.video.clientHeight;
+      initGame(vw, vh);
+      gameOn = true;
+    });
+
+    els.paddleSize.addEventListener('input', () => {
+      if (!running) return;
+      const vw = els.video.clientWidth, vh = els.video.clientHeight;
+      const oldW = effectivePaddleW();
+      const center = game.paddleX + oldW/2;
+      game.paddleBaseW = Math.max(90, Math.floor(vw * 0.12 * parseFloat(els.paddleSize.value)));
+      const newW = effectivePaddleW();
+      game.paddleX = Math.max(0, Math.min(vw - newW, center - newW/2));
+    });
+
+    addEventListener('pagehide', () => {
+      running = false;
+      const s = els.video.srcObject; s && s.getTracks().forEach(t=>t.stop());
+      faceLandmarker && faceLandmarker.close && faceLandmarker.close();
+    });
+  </script>
+</body>
+</html>
